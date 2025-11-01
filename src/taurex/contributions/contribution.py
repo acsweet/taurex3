@@ -289,6 +289,7 @@ class Contribution(Fittable, Logger, Writeable, Citable):
             tau,
             self._ngrid,
         )
+        # print(f'(tm) sigma_xsec: {self.sigma_xsec.shape}')
         contribute_tau(
             start_layer,
             end_layer,

@@ -101,6 +101,7 @@ class TransmissionModel(OneDForwardModel):
         total_layers = self.nLayers
 
         z = self.altitudeProfile
+        # print(f'(tm), z (altitude profile): {z}')
         self.debug("Computing path_length: \n z=%s \n dz=%s", z, dz)
 
         for layer in range(0, total_layers):
@@ -156,6 +157,7 @@ class TransmissionModel(OneDForwardModel):
         hemispherical geometry.
 
         """
+        # print('(tm) path_integral')
         dz = self.deltaz
 
         total_layers = self.nLayers
@@ -164,11 +166,16 @@ class TransmissionModel(OneDForwardModel):
 
         density_profile = self.densityProfile
 
+        # print(f'(tm) path_integral, dz: {dz}, total_layers: {total_layers}, wngrid_size: {wngrid_size}, \ndensity_profile: {density_profile}')
+        # print(f'(tm) path_integral, new_method: {self.new_method}')
+        # print(f'(tm) path_integral, contribution_list: {self.contribution_list}')
+
         if self.new_method:
             path_length = self.compute_path_length()
         else:
             path_length = self.compute_path_length_old(dz)
         self.path_length = path_length
+        # print(f'(tm) path_integral, path_length: {self.path_length}')
 
         tau = np.zeros(shape=(total_layers, wngrid_size), dtype=np.float64)
 
@@ -182,9 +189,11 @@ class TransmissionModel(OneDForwardModel):
                 if tau[layer].min() > 10:
                     break
                 self.debug("Adding contribution from %s", contrib.name)
+                # print(f'(tm) contrib {contrib.name} - tau {tau.shape}')
                 contrib.contribute(
                     self, 0, end_k, layer, layer, density_profile, tau, path_length=dl
                 )
+            # print(f'(tm) (layer: {layer}) tau: {tau[layer]}')
 
         self.debug("tau %s %s", tau, tau.shape)
 
@@ -195,14 +204,26 @@ class TransmissionModel(OneDForwardModel):
         self, tau: npt.NDArray[np.float64], dz: npt.NDArray[np.float64]
     ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """Compute final absorption and optical depth."""
+        # print(f'(tm - compute_absorption) tau: {np.min(tau)} - {np.max(tau)}')
         tau = np.exp(-tau)
         ap = self.altitudeProfile[:, None]
         pradius = self._planet.fullRadius
         sradius = self._star.radius
         _dz = dz[:, None]
 
+        # print(f'(tm - compute_absorption) planet_radius: {pradius}')
+        # print(f'(tm - compute_absorption) star_radius: {sradius}')
+        # print(f'(tm - compute_absorption) tau_exp: {np.min(tau)} - {np.max(tau)}')
+        # print(f'(tm - compute_absorption) altitudeProfile: {np.min(ap)} - {np.max(ap)}')
+        # print(f'(tm - compute_absorption) _dz: {np.min(_dz)} - {np.max(_dz)}')
+
         integral = np.sum((pradius + ap) * (1.0 - tau) * _dz * 2.0, axis=0)
-        return ((pradius**2.0) + integral) / (sradius**2), tau
+        absorption = ((pradius**2.0) + integral) / (sradius**2)
+
+        # print(f'(tm - compute_absorption) integral: {np.min(integral)} - {np.max(integral)}')
+        # print(f'(tm - compute_absorption) absorption: {np.min(absorption)} - {np.max(absorption)}')
+
+        return absorption, tau
 
     @classmethod
     def input_keywords(cls) -> t.Tuple[str, ...]:

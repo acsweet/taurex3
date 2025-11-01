@@ -306,14 +306,17 @@ class SimpleForwardModel(ForwardModel):
         """
 
         self.contribution_list.sort(key=lambda x: x.order)
+        # print('self.contribution_list', self.contribution_list)
 
         self.info("Building model........")
         # self._compute_inital_mu()
         self.info("Collecting paramters")
         self.collect_fitting_parameters()
+        # print('self._fitting_parameters', self._fitting_parameters)
         self.collect_derived_parameters()
+        # print('self._derived_parameters', self._derived_parameters)
         self.info("Setting up profiles")
-        # self.initialize_profiles()
+        self.initialize_profiles()
 
         self.info("Setting up contributions")
         # for contrib in self.contribution_list:

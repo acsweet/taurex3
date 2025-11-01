@@ -12,3 +12,8 @@ __pycache__/
 .vscode
 .ipynb_checkpoints
 scratch
+.DS_Store
+
+*.zip
+test_files/
+*.hdf5
