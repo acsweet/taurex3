@@ -3,10 +3,41 @@ Run script for fitting atmospheric parameters using the fully differentiable JAX
 
 This script uses the new full_diff_create_binned_forward_model which recomputes
 all parameter-dependent quantities on each forward pass.
+
+PRECISION CONFIGURATION:
+------------------------
+Edit USE_FLOAT64 below to switch between float32 and float64:
+
+    USE_FLOAT64 = True   →  float64 (safer, ~1.5-2x slower, 2x memory)
+    USE_FLOAT64 = False  →  float32 (~2x faster, half memory, may overflow)
+
+Both modes use GPU acceleration on your RTX 3080 Ti!
+
+For atmospheric modeling, float64 is recommended unless you've verified
+that float32 doesn't cause numerical issues (NaN/Inf).
 """
 
 import time
+import jax
 import jax.numpy as jnp
+
+# ========== PRECISION CONFIGURATION ==========
+# Set to True for float64 (safer, ~1.5-2x slower)
+# Set to False for float32 (~2x faster, uses half memory, may overflow)
+USE_FLOAT64 = True
+
+# Configure JAX BEFORE importing experiment
+jax.config.update("jax_enable_x64", USE_FLOAT64)
+
+# Choose dtype
+DTYPE = jnp.float64 if USE_FLOAT64 else jnp.float32
+
+print("="*70)
+print(f"JAX Configuration:")
+print(f"  Precision: {'float64' if USE_FLOAT64 else 'float32'}")
+print(f"  Device: {jax.devices()[0]}")
+print(f"  Default dtype: {jnp.array(1.0).dtype}")
+print("="*70)
 
 from taurex.cache import OpacityCache, CIACache
 from taurex.contributions import AbsorptionContribution, CIAContribution, RayleighContribution
@@ -30,9 +61,13 @@ def main():
     
     # ========== SETUP PATHS ==========
     print("Setting up data paths...")
-    xsec_path = "/Users/asweet/Code/research/taurex3/test_files/Input/xsec/xsec_sampled_R15000_0.3-50"
-    cia_path = "/Users/asweet/Code/research/taurex3/test_files/Input/cia/HITRAN/data"
-    obs_path = "/Users/asweet/Code/research/taurex3/test_files/quickstart.dat"
+    # xsec_path = "/Users/asweet/Code/research/taurex3/test_files/Input/xsec/xsec_sampled_R15000_0.3-50"
+    # cia_path = "/Users/asweet/Code/research/taurex3/test_files/Input/cia/HITRAN/data"
+    # obs_path = "/Users/asweet/Code/research/taurex3/test_files/quickstart.dat"
+
+    xsec_path = "test_files/xsec/xsec_sampled_R15000_0.3-50"
+    cia_path = "test_files/cia/HITRAN/data"
+    obs_path = "examples/parfiles/quickstart.dat"
 
     # Setup caches
     OpacityCache().clear_cache()
@@ -73,15 +108,16 @@ def main():
     print("\nLoading observations...")
     obs = ObservedSpectrum(obs_path)
     
-    # Setup observed data
-    obs_y = jnp.asarray(obs.spectrum)
+    # Setup observed data (convert to target dtype)
+    obs_y = jnp.asarray(obs.spectrum, dtype=DTYPE)
     if hasattr(obs, "errorBar"):
-        obs_err = jnp.asarray(obs.errorBar)
+        obs_err = jnp.asarray(obs.errorBar, dtype=DTYPE)
     else:
         obs_err = 0.02 * jnp.maximum(jnp.abs(obs_y), 1e-12)
 
     print(f"  Spectral bins: {len(obs_y)}")
     print(f"  Wavelength range: {obs.wavelengthGrid.min():.2f} - {obs.wavelengthGrid.max():.2f} μm")
+    print(f"  Data dtype: {obs_y.dtype}")
 
     # ========== CREATE FORWARD MODEL ==========
     print("\nCreating fully differentiable JAX forward model...")
@@ -99,14 +135,15 @@ def main():
 
     # ========== EXTRACT PARAMETERS ==========
     print("\nExtracting fitting parameters...")
-    params, param_info = extract_fitting_params(tm)
+    # NEW: Pass dtype to ensure consistent precision
+    params, param_info = extract_fitting_params(tm, dtype=DTYPE)
     
     print("Available fitting parameters:")
     for key, info in param_info.items():
         if info['scale'] == 'log':
-            print(f"  {key}: {float(params[key]):.3e} (log scale, range: {info['range']})")
+            print(f"  {key}: {float(params[key]):.3e} [{params[key].dtype}] (log scale, range: {info['range']})")
         else:
-            print(f"  {key}: {float(params[key]):.6f} (linear scale, range: {info['range']})")
+            print(f"  {key}: {float(params[key]):.6f} [{params[key].dtype}] (linear scale, range: {info['range']})")
 
     # ========== DEFINE FITTING PARAMETERS ==========
     # Choose which parameters to fit
@@ -197,6 +234,12 @@ def main():
 
     print("\n" + "="*70)
     print("RUN COMPLETE!")
+    print("="*70)
+    print(f"Configuration used:")
+    print(f"  Precision: {DTYPE}")
+    print(f"  Device: {jax.devices()[0]}")
+    print(f"  Total time: {elapsed_time:.2f} seconds")
+    print(f"  Average time per step: {elapsed_time/500:.4f} seconds")
     print("="*70)
 
 

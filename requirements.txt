@@ -1,0 +1,8 @@
+numpy
+scipy
+astropy
+h5py
+pandas
+matplotlib
+jax[cuda13]
+optax

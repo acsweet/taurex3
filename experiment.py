@@ -7,24 +7,37 @@ import optax
 from functools import partial
 from typing import Dict, Tuple, Any
 
-from taurex.constants import KBOLTZ
-from taurex.cache import OpacityCache, CIACache
-from taurex.contributions import AbsorptionContribution, CIAContribution, RayleighContribution
-from taurex.data.spectrum.observed import ObservedSpectrum
+from taurex.constants import KBOLTZ, RJUP
+from taurex.cache import OpacityCache # , CIACache
+from taurex.contributions import AbsorptionContribution, CIAContribution # , RayleighContribution
+# from taurex.data.spectrum.observed import ObservedSpectrum
 from taurex.model import TransmissionModel
 from taurex.util import clip_native_to_wngrid
 
-from taurex.planet import Planet
-from taurex.stellar import BlackbodyStar
-from taurex.chemistry import TaurexChemistry, ConstantGas
-from taurex.temperature import Isothermal
+# from taurex.planet import Planet
+# from taurex.stellar import BlackbodyStar
+# from taurex.chemistry import TaurexChemistry, ConstantGas
+# from taurex.temperature import Isothermal
 
 # Enable 64-bit precision
-jax.config.update("jax_enable_x64", True)
+# jax.config.update("jax_enable_x64", True)
 
 # ========== PARAMETER EXTRACTION ==========
-def extract_fitting_params(taurex_model) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
-    """Extract fitting parameters from taurex model."""
+def extract_fitting_params(taurex_model, dtype=None) -> Tuple[Dict[str, jnp.ndarray], Dict[str, Any]]:
+    """
+    Extract fitting parameters from taurex model.
+    
+    Args:
+        taurex_model: TauREx model
+        dtype: Target JAX dtype (e.g., jnp.float32 or jnp.float64).
+               If None, uses JAX's default based on jax_enable_x64 setting.
+               Note: For float32, you MUST explicitly pass dtype=jnp.float32,
+               as Python floats are 64-bit and may stay float64.
+    
+    Returns:
+        params: Dict of parameter name -> JAX array
+        param_info: Dict of parameter metadata (range, scale, latex)
+    """
     fitting_params = {}
     param_info = {}
     
@@ -39,8 +52,12 @@ def extract_fitting_params(taurex_model) -> Tuple[Dict[str, jnp.ndarray], Dict[s
             'latex': val[1]
         }
     
-    # Convert to JAX arrays
-    params = {k: jnp.array(v) for k, v in fitting_params.items()}
+    # Convert to JAX arrays with explicit dtype if specified
+    if dtype is not None:
+        params = {k: jnp.array(v, dtype=dtype) for k, v in fitting_params.items()}
+    else:
+        params = {k: jnp.array(v) for k, v in fitting_params.items()}
+    
     return params, param_info
 
 # ========== JAX FORWARD MODEL ==========
@@ -107,28 +124,40 @@ def compute_absorption(tau, dz, altitude_profile, planet_radius, star_radius):
 
     return absorption, tau_exp
 
-def prepare_model_data(taurex_model: TransmissionModel):
-    """Prepare static model data for JAX computation."""
+def prepare_model_data(taurex_model: TransmissionModel, dtype=None):
+    """
+    Prepare static model data for JAX computation.
+    
+    Args:
+        taurex_model: TauREx transmission model
+        dtype: Target JAX dtype for arrays (e.g., jnp.float32).
+               If None, uses JAX default. Scalars remain as Python floats/ints.
+    """
     if not taurex_model.built:
         taurex_model.build()
     
     taurex_model.initialize_profiles()
     
+    # Helper function for array conversion
+    def to_jax(arr):
+        return jnp.array(arr, dtype=dtype) if dtype is not None else jnp.array(arr)
+    
     model_data = {
-        'deltaz': jnp.array(taurex_model.deltaz),
+        'deltaz': to_jax(taurex_model.deltaz),
         'total_layers': int(taurex_model.nLayers),
-        'altitude_profile': jnp.array(taurex_model.altitudeProfile),
-        'pressure_profile': jnp.array(taurex_model.pressureProfile),
+        'altitude_profile': to_jax(taurex_model.altitudeProfile),
+        'pressure_profile': to_jax(taurex_model.pressureProfile),
         'planet_radius_base': float(taurex_model._planet.fullRadius),
         'star_radius': float(taurex_model._star.radius),
     }
     
     return model_data
 
-# Add this dictionary near the top of your file
+# Molecular weights (g/mol) for mean molecular weight calculation
 MOLECULAR_WEIGHTS = {
     'H2': 2.016, 'He': 4.0026, 'H2O': 18.015, 'N2': 28.014,
-    'CH4': 16.04, 'CO': 28.01, 'CO2': 44.01
+    'CH4': 16.04, 'CO': 28.01, 'CO2': 44.01, 'NH3': 17.03,
+    'O2': 32.00, 'O3': 48.00, 'HCN': 27.03, 'C2H2': 26.04
     # Add other molecules as needed
 }
 
@@ -261,7 +290,10 @@ def path_integral(wngrid, params, absorption_sigmas_tuple, dynamic_data, static_
     
     # 3. Get variable parameters
     T = params['T']
-    planet_radius = params['planet_radius'] * planet_radius_base
+    # BUG FIX: planet_radius parameter is in R_jup, not a scaling factor!
+    # We must multiply by RJUP to get meters, not by planet_radius_base
+    # Cast RJUP to match the dtype of the parameter for precision consistency
+    planet_radius = params['planet_radius'] * jnp.array(RJUP, dtype=params['planet_radius'].dtype)
     
     # 4. Calculate current mean molecular weight
     mix_ratios = jnp.array([params.get(g, 0.0) for g in active_gases])
@@ -551,21 +583,30 @@ def full_diff_compute_density_profile(pressure_profile, temperature_profile):
     return pressure_profile / (KBOLTZ * temperature_profile)
 
 
-def full_diff_prepare_model_data(taurex_model):
+def full_diff_prepare_model_data(taurex_model, dtype=None):
     """
     Extract static and initial data from TauREx model for full differentiable version.
     This extracts things that don't change during fitting.
+    
+    Args:
+        taurex_model: TauREx transmission model
+        dtype: Target JAX dtype for arrays (e.g., jnp.float32).
+               If None, uses JAX default. Scalars remain as Python floats/ints.
     """
     if not taurex_model.built:
         taurex_model.build()
     
     taurex_model.initialize_profiles()
     
+    # Helper function for array conversion
+    def to_jax(arr):
+        return jnp.array(arr, dtype=dtype) if dtype is not None else jnp.array(arr)
+    
     # Static configuration (doesn't change with parameters)
     static_data = {
         'nlayers': int(taurex_model.nLayers),
-        'pressure_profile': jnp.array(taurex_model.pressureProfile),
-        'pressure_levels': jnp.array(taurex_model.pressure.pressure_profile_levels),
+        'pressure_profile': to_jax(taurex_model.pressureProfile),
+        'pressure_levels': to_jax(taurex_model.pressure.pressure_profile_levels),
         'planet_mass': float(taurex_model._planet.fullMass),  # In kg (not Jupiter masses!)
         'planet_radius_base': float(taurex_model._planet.fullRadius),  # In m
         'star_radius': float(taurex_model._star.radius),  # In m
@@ -576,10 +617,10 @@ def full_diff_prepare_model_data(taurex_model):
     
     # Initial state (for debugging/comparison)
     initial_state = {
-        'temperature_profile': jnp.array(taurex_model.temperatureProfile),
-        'altitude_profile': jnp.array(taurex_model.altitudeProfile),
-        'deltaz': jnp.array(taurex_model.deltaz),
-        'mu_profile': jnp.array(taurex_model.chemistry.muProfile),
+        'temperature_profile': to_jax(taurex_model.temperatureProfile),
+        'altitude_profile': to_jax(taurex_model.altitudeProfile),
+        'deltaz': to_jax(taurex_model.deltaz),
+        'mu_profile': to_jax(taurex_model.chemistry.muProfile),
     }
     
     return static_data, initial_state
@@ -589,7 +630,7 @@ def full_diff_prepare_model_data(taurex_model):
 # OPACITY INTERPOLATION - Fully differentiable opacity handling
 # ========================================================================
 
-def load_opacity_data(active_gases, wngrid_target, pre_interpolate_to_target=False):
+def load_opacity_data(active_gases, wngrid_target, pre_interpolate_to_target=False, dtype=None):
     """
     Load opacity grids from OpacityCache into JAX-compatible format.
     This should be called ONCE outside the JIT-compiled forward model.
@@ -600,12 +641,18 @@ def load_opacity_data(active_gases, wngrid_target, pre_interpolate_to_target=Fal
         pre_interpolate_to_target: If True, pre-interpolate spectral dimension to target grid
             This reduces memory usage and speeds up CPU execution ~2-3x, but is less necessary
             on GPU. Default False to preserve full-resolution behavior for GPU testing.
+        dtype: Target JAX dtype for opacity arrays (e.g., jnp.float32).
+               If None, uses JAX default.
     
     Returns:
         opacity_data: Dict of {gas_name: opacity_info_dict}
     """
     opacity_cache = OpacityCache()
     opacity_data = {}
+    
+    # Helper function for array conversion
+    def to_jax(arr):
+        return jnp.array(arr, dtype=dtype) if dtype is not None else jnp.array(arr)
     
     for gas in active_gases:
         try:
@@ -639,9 +686,9 @@ def load_opacity_data(active_gases, wngrid_target, pre_interpolate_to_target=Fal
                 
                 # Store with target grid (no spectral interpolation needed later)
                 opacity_data[gas] = {
-                    'T_grid': jnp.array(T_grid),
-                    'P_grid': jnp.array(P_grid),
-                    'sigma_grid': jnp.array(sigma_grid),  # (nT, nP, nWN_target)
+                    'T_grid': to_jax(T_grid),
+                    'P_grid': to_jax(P_grid),
+                    'sigma_grid': to_jax(sigma_grid),  # (nT, nP, nWN_target)
                     'pre_interpolated': True,  # Flag to skip spectral interp
                 }
             else:
@@ -656,11 +703,11 @@ def load_opacity_data(active_gases, wngrid_target, pre_interpolate_to_target=Fal
                         sigma_grid[i, j, :] = xsec.opacity(T, P, wn_grid_native)
                 
                 opacity_data[gas] = {
-                    'T_grid': jnp.array(T_grid),
-                    'P_grid': jnp.array(P_grid),
-                    'wn_grid': jnp.array(wn_grid_native),
-                    'sigma_grid': jnp.array(sigma_grid),  # (nT, nP, nWN_native)
-                    'wngrid_target': jnp.array(wngrid_target),
+                    'T_grid': to_jax(T_grid),
+                    'P_grid': to_jax(P_grid),
+                    'wn_grid': to_jax(wn_grid_native),
+                    'sigma_grid': to_jax(sigma_grid),  # (nT, nP, nWN_native)
+                    'wngrid_target': to_jax(wngrid_target),
                     'pre_interpolated': False,
                 }
             
@@ -884,7 +931,9 @@ def full_diff_create_forward_model(taurex_model: TransmissionModel, wngrid,
         )
         
         # Step 4: Compute altitude/gravity/scale height from current T, μ, planet_radius
-        planet_radius = params['planet_radius'] * planet_radius_base
+        # BUG FIX: planet_radius parameter is in R_jup, not a scaling factor!
+        # Cast RJUP to match the dtype of the parameter for precision consistency
+        planet_radius = params['planet_radius'] * jnp.array(RJUP, dtype=params['planet_radius'].dtype)
         altitude_boundaries, scale_height, gravity, deltaz = full_diff_compute_altitude_profile(
             T_profile,
             pressure_levels,
@@ -1282,6 +1331,14 @@ def fit_with_value_and_grad_adam(
         N = y.size
         return 0.5 * (r @ alpha) + 0.5 * logdet + 0.5 * N * jnp.log(2.0*jnp.pi)
 
+    # ---- regularization setup ----
+    # Extract regularization settings
+    l2_reg = float(loss_kwargs.get("l2_reg", 0.0))  # L2 penalty on parameter changes
+    log_prior = loss_kwargs.get("log_prior", None)  # Prior std in log-space for mixing ratios
+    
+    # Store initial parameters for L2 regularization
+    init_c_fit = {k: init_params[k] for k in fit_params}
+    
     # ---- master loss ----
     def loss_fn(uvec_):
         udict = unpack(uvec_)
@@ -1292,18 +1349,19 @@ def fit_with_value_and_grad_adam(
         if nan_guard:
             pred = jnp.nan_to_num(pred, nan=0.0, posinf=1e300, neginf=-1e300)
 
+        # Compute data likelihood
         if loss == "mse":
-            return mse_loss(obs_y, pred, obs_err, reduction=reduction)
+            data_loss = mse_loss(obs_y, pred, obs_err, reduction=reduction)
 
         elif loss == "gaussian":
-            return gaussian_nll(obs_y, pred, obs_err)
+            data_loss = gaussian_nll(obs_y, pred, obs_err)
 
         elif loss == "lognormal":
-            return lognormal_nll(obs_y, pred, obs_err)
+            data_loss = lognormal_nll(obs_y, pred, obs_err)
 
         elif loss == "studentt":
             nu = float(loss_kwargs.get("nu", 4.0))
-            return studentt_nll(obs_y, pred, obs_err, nu=nu)
+            data_loss = studentt_nll(obs_y, pred, obs_err, nu=nu)
 
         elif loss == "gp":
             if x_for_gp is None:
@@ -1314,11 +1372,40 @@ def fit_with_value_and_grad_adam(
             ell  = float(loss_kwargs.get("ell", 10.0))
             jitter = float(loss_kwargs.get("jitter", 1e-6))
             sigma_eff = jnp.sqrt(obs_err**2 + noise_floor**2)
-            return gaussian_gp_nll(obs_y, pred, x, sigma_eff, rho, ell, jitter=jitter)
+            data_loss = gaussian_gp_nll(obs_y, pred, x, sigma_eff, rho, ell, jitter=jitter)
 
         else:
             raise ValueError(f"Unknown loss '{loss}'. "
                              "Choose from: 'mse', 'gaussian', 'lognormal', 'studentt', 'gp'.")
+        
+        # Add regularization terms
+        reg_loss = 0.0
+        
+        # L2 regularization: penalize deviations from initial parameters
+        if l2_reg > 0.0:
+            for k in fit_params:
+                delta = (c_fit[k] - init_c_fit[k]) / (jnp.abs(init_c_fit[k]) + 1e-12)
+                reg_loss = reg_loss + l2_reg * jnp.sum(delta**2)
+        
+        # Log-space priors for mixing ratios (prevents them going to zero)
+        if log_prior is not None:
+            log_prior_std = float(log_prior)
+            # Apply to all parameters with init_val in range [1e-12, 1.0] (likely mixing ratios)
+            # Use JAX where to make it JIT-compatible
+            for k in fit_params:
+                val = c_fit[k]
+                init_val = init_c_fit[k]
+                # Check if this looks like a mixing ratio using JAX ops
+                is_mixing_ratio = jnp.logical_and(init_val > 1e-12, init_val < 1.0)
+                # Only apply prior if it's a mixing ratio
+                log_val = jnp.log(jnp.maximum(val, 1e-30))
+                log_init = jnp.log(jnp.maximum(init_val, 1e-30))
+                log_delta = (log_val - log_init) / log_prior_std
+                penalty = 0.5 * jnp.sum(log_delta**2)
+                # Use where to conditionally add penalty
+                reg_loss = reg_loss + jnp.where(is_mixing_ratio, penalty, 0.0)
+        
+        return data_loss + reg_loss
 
     loss_and_grad = jax.jit(jax.value_and_grad(loss_fn))
 
@@ -1343,8 +1430,17 @@ def fit_with_value_and_grad_adam(
     return final_params, losses
 
 # ========== PLOTTING ==========
-def plot_fit_comparison(obs, forward_binned, initial_params, final_params, fit_params):
-    """Plot comparison between observed data and fitted model."""
+def plot_fit_comparison(obs, forward_binned, initial_params, final_params, fit_params, save_figure=True):
+    """Plot comparison between observed data and fitted model.
+    
+    Args:
+        obs: Observed spectrum object
+        forward_binned: Forward model function
+        initial_params: Initial parameter values
+        final_params: Final fitted parameter values
+        fit_params: List of parameter names that were fitted
+        save_figure: If True, save the figure as 'fit_comparison.png' (default: True)
+    """
     import matplotlib.pyplot as plt
     
     # Generate predictions
@@ -1402,6 +1498,12 @@ def plot_fit_comparison(obs, forward_binned, initial_params, final_params, fit_p
         print(f"Chi-squared: {chi_squared:.2f}")
         print(f"Reduced chi-squared: {reduced_chi_squared:.2f}")
         print(f"RMS residual: {np.sqrt(np.mean(final_residuals**2)):.6f}")
+    
+    # Save figure if requested
+    if save_figure:
+        filename = 'fit_comparison.png'
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"\nFigure saved as: {filename}")
     
     plt.show()
     
