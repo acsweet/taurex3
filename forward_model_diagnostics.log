@@ -1,0 +1,115 @@
+Numba not installed, using numpy instead
+Setting up...
+Loading planet 1000...
+Creating model...
+Pre-loading opacities for gases: ('H2O', 'CO2', 'CO', 'CH4', 'NH3')
+Loading H2O opacity: T=27, P=22, WN=76744 (native resolution)
+Loading CO2 opacity: T=27, P=22, WN=76744 (native resolution)
+Loading CO opacity: T=27, P=22, WN=76744 (native resolution)
+Loading CH4 opacity: T=27, P=22, WN=76744 (native resolution)
+Loading NH3 opacity: T=27, P=22, WN=76744 (native resolution)
+[binning] W shape: (52, 70564), empty rows: 0, partial rows: 0
+[grids] high-res N=70564, bins=52, observed points=52
+
+======================================================================
+FORWARD MODEL DIAGNOSTICS
+======================================================================
+
+Forward Model Consistency Check:
+======================================================================
+Running forward model 5 times with same parameters...
+Mean spectrum value: 8.889004e-03
+Max difference between runs: 0.000000e+00
+Relative difference: 0.000000%
+✓ Forward model is deterministic
+
+TauREx Native vs JAX Forward Model:
+======================================================================
+TauREx native points: scalar
+JAX binned points: 52
+
+Gradient Direction Test:
+======================================================================
+Initial loss: 33.792568
+
+Testing small steps in OPPOSITE direction of gradient:
+(Negative gradient direction should DECREASE loss)
+----------------------------------------------------------------------
+
+planet_radius:
+  Value: 8.638782e-01
+  Gradient: 1.502258e+04
+  lr=1e-06: step=-1.502e-02, new_loss=494.150555, Δ=+460.357987 ✗
+  lr=1e-05: step=-1.502e-01, new_loss=55692.457132, Δ=+55658.664564 ✗
+  lr=1e-04: step=-1.502e+00, new_loss=118356.991974, Δ=+118323.199406 ✗
+  lr=1e-03: step=-1.502e+01, new_loss=38795148880.920967, Δ=+38795148847.128403 ✗
+
+T:
+  Value: 9.522177e+02
+  Gradient: 1.614945e-01
+  lr=1e-06: step=-1.615e-07, new_loss=33.792568, Δ=-0.000000 ✓
+  lr=1e-05: step=-1.615e-06, new_loss=33.792567, Δ=-0.000000 ✓
+  lr=1e-04: step=-1.615e-05, new_loss=33.792565, Δ=-0.000003 ✓
+  lr=1e-03: step=-1.615e-04, new_loss=33.792541, Δ=-0.000026 ✓
+
+H2O:
+  Value: 6.278872e-10
+  Gradient: 5.694591e+07
+  lr=1e-06: step=-5.695e+01, new_loss=107.263387, Δ=+73.470820 ✗
+  lr=1e-05: step=-5.695e+02, new_loss=106.804246, Δ=+73.011679 ✗
+  lr=1e-04: step=-5.695e+03, new_loss=nan, Δ=+nan ✗
+  lr=1e-03: step=-5.695e+04, new_loss=nan, Δ=+nan ✗
+
+======================================================================
+PARAMETER SENSITIVITY ANALYSIS
+======================================================================
+
+Parameter Sensitivity: planet_radius
+======================================================================
+Initial value: 8.638782e-01
+Initial loss: 33.792568
+----------------------------------------------------------------------
+    -2.0%: value=8.466006e-01, loss=679.222864, Δ=+645.430297 (worse)
+    -1.0%: value=8.552394e-01, loss=132.628676, Δ=+98.836109 (worse)
+    -0.5%: value=8.595588e-01, loss=26.354535, Δ=-7.438033 (better)
+    -0.1%: value=8.630143e-01, loss=23.122435, Δ=-10.670133 (better)
+    +0.0%: value=8.638782e-01, loss=33.792568, Δ=+0.000000 (worse)
+    +0.1%: value=8.647421e-01, loss=49.082571, Δ=+15.290003 (worse)
+    +0.5%: value=8.681976e-01, loss=156.728174, Δ=+122.935607 (worse)
+    +1.0%: value=8.725170e-01, loss=396.956965, Δ=+363.164398 (worse)
+    +2.0%: value=8.811557e-01, loss=1236.527682, Δ=+1202.735114 (worse)
+
+Parameter Sensitivity: H2O
+======================================================================
+Initial value: 6.278872e-10
+Initial loss: 33.792568
+----------------------------------------------------------------------
+   -50.0%: value=3.139436e-10, loss=33.773874, Δ=-0.018694 (better)
+   -20.0%: value=5.023097e-10, loss=33.785293, Δ=-0.007275 (better)
+   -10.0%: value=5.650985e-10, loss=33.788962, Δ=-0.003606 (better)
+    -5.0%: value=5.964928e-10, loss=33.790772, Δ=-0.001795 (better)
+    +0.0%: value=6.278872e-10, loss=33.792568, Δ=+0.000000 (worse)
+    +5.0%: value=6.592815e-10, loss=33.794348, Δ=+0.001780 (worse)
+   +10.0%: value=6.906759e-10, loss=33.796114, Δ=+0.003546 (worse)
+   +20.0%: value=7.534646e-10, loss=33.799603, Δ=+0.007035 (worse)
+   +50.0%: value=9.418308e-10, loss=33.809755, Δ=+0.017187 (worse)
+
+======================================================================
+LOSS LANDSCAPE ANALYSIS
+======================================================================
+
+Computing loss landscape for planet_radius vs T...
+Minimum loss in grid: 14.967445
+  planet_radius: 8.616048e-01 (current: 8.638782e-01)
+  T: 9.046068e+02 (current: 9.522177e+02)
+Saved: loss_landscape_planet_radius_T.png
+
+Computing loss landscape for H2O vs CO2...
+Minimum loss in grid: 33.790427
+  H2O: 5.964928e-10 (current: 6.278872e-10)
+  CO2: 2.356802e-10 (current: 2.244573e-10)
+Saved: loss_landscape_H2O_CO2.png
+
+======================================================================
+DIAGNOSTICS COMPLETE
+======================================================================

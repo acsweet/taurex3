@@ -468,42 +468,96 @@ def fit_adc_planet(
     planet_id,
     data_dir='test_files/adc_2023/TrainingData',
     fit_params=['planet_radius', 'T', 'H2O', 'CO2', 'CO', 'CH4', 'NH3'],
-    steps=500,
-    lr=1e-3,
+    steps=1000,
+    lr=1e-3,  # Learning rate (for Adam optimizer)
     nlayers=30,
     dtype=jnp.float64,
     verbose=True,
-    l2_reg=0.0,
-    log_prior=None
+    l2_reg=0.0,  # L2 regularization (0 = no penalty on parameter changes)
+    log_prior=None,  # Log-space prior for mixing ratios (None = no prior)
+    clip_norm=1.0,  # Gradient clipping norm (for Adam)
+    adc_priors=None,  # ADC competition prior bounds (will override TauREx defaults)
+    ground_truth_method='weighted_mean',  # How to sample from posterior: weighted_mean, weighted_random, max_weight
+    randomize_start=False,  # If True, randomize initial parameters within prior bounds
+    randomize_scale=0.5,  # Fraction of prior range to randomize (0.5 = ±50% of range)
+    random_seed=None,  # Random seed for reproducibility
+    optimizer='adam',  # Optimizer: 'adam' or 'lbfgs'
+    multi_start=1,  # Number of random initializations (for L-BFGS multi-start)
+    loss='chi_squared'  # Loss function: 'chi_squared' (recommended) or 'mse'
 ):
     """
     Complete pipeline to load ADC planet and fit atmospheric parameters.
+    
+    This fits the model to the OBSERVED SPECTRUM. The 'ground_truth' parameters
+    are from posterior distributions of previous retrievals (using Nestle + TauREx),
+    which we use for validation, not as the optimization target.
     
     Args:
         planet_id: Planet identifier (e.g., 1, 100, 'train1')
         data_dir: Directory containing ADC data files
         fit_params: List of parameter names to fit
-        steps: Optimization steps
-        lr: Learning rate
+        steps: Optimization steps (for Adam; ignored for L-BFGS which uses maxiter)
+        lr: Learning rate (for Adam optimizer, default 1e-3)
         nlayers: Number of atmospheric layers
         dtype: JAX dtype (jnp.float64 or jnp.float32)
         verbose: Print progress
-        l2_reg: L2 regularization strength (penalizes parameter changes from initial)
-        log_prior: Log-space prior std for mixing ratios (prevents them going to zero)
+        l2_reg: L2 regularization strength (0 = none, >0 = penalize changes from initial)
+        log_prior: Log-space prior std for mixing ratios (None = no prior, >0 = constrain)
+        clip_norm: Gradient clipping norm (for Adam, prevents huge steps)
+        adc_priors: Dict of parameter bounds from ADC competition. If None, uses default:
+            {
+                'planet_radius': [0.1, 3],
+                'T': [0, 7000],
+                'H2O': [1e-12, 0.1],
+                'CO2': [1e-12, 0.1],
+                'CO': [1e-12, 0.1],
+                'CH4': [1e-12, 0.1],
+                'NH3': [1e-12, 0.1]
+            }
+        ground_truth_method: How to sample from posterior distribution:
+            - 'weighted_mean': Posterior expectation (most stable, default)
+            - 'weighted_random': Random sample weighted by posterior
+            - 'max_weight': Maximum a posteriori (MAP) estimate
+        randomize_start: If True, start from random parameters instead of posterior mean
+        randomize_scale: Fraction of prior range for randomization (e.g., 0.5 = ±50%)
+        random_seed: Random seed for reproducibility
+        optimizer: Optimizer to use:
+            - 'adam': First-order adaptive method (good for exploration)
+            - 'lbfgs': L-BFGS-B quasi-Newton method (faster convergence, recommended)
+        multi_start: Number of random initializations (only for L-BFGS, 1=single run)
+        loss: Loss function:
+            - 'chi_squared': Chi-squared (weighted by measurement uncertainties, recommended)
+            - 'mse': Mean squared error (unweighted)
     
     Returns:
         dict with:
             - final_params: Fitted parameters
             - losses: Loss history
             - initial_params: Starting parameters
+            - param_info: Parameter metadata (bounds, scales)
             - taurex_model: TauREx model
             - forward_model: JAX forward model
             - obs_spectrum: Observed spectrum object
-            - ground_truth: Ground truth parameters (if available)
+            - spectrum_dict: Raw spectrum data
+            - ground_truth: Ground truth parameters from posterior (if available)
+            - aux_data: Auxiliary stellar/planetary data
+            - all_results: (L-BFGS only) All multi-start results
     """
     import os
     from taurex.cache import OpacityCache, CIACache
     from experiment import extract_fitting_params, fit_with_value_and_grad_adam
+    
+    # Default ADC 2023 competition priors
+    if adc_priors is None:
+        adc_priors = {
+            'planet_radius': [0.1, 3.0],
+            'T': [0.0, 7000.0],
+            'H2O': [1e-12, 0.1],
+            'CO2': [1e-12, 0.1],
+            'CO': [1e-12, 0.1],
+            'CH4': [1e-12, 0.1],
+            'NH3': [1e-12, 0.1]
+        }
     
     # Initialize opacity caches if not already set
     if not OpacityCache()._opacity_path:
@@ -524,10 +578,10 @@ def fit_adc_planet(
     aux_data = load_auxiliary_data(aux_path, planet_id)
     
     try:
-        ground_truth = load_ground_truth(tracedata_path, planet_id, sample_method='weighted_random')
+        ground_truth = load_ground_truth(tracedata_path, planet_id, sample_method=ground_truth_method)
         has_gt = True
         if verbose:
-            print(f"  Ground truth available (sampled from {ground_truth['n_samples']} posterior samples)")
+            print(f"  Ground truth available (method: {ground_truth_method}, {ground_truth['n_samples']} posterior samples)")
     except:
         ground_truth = None
         has_gt = False
@@ -566,44 +620,121 @@ def fit_adc_planet(
     # Extract parameters
     params, param_info = extract_fitting_params(tm, dtype=dtype)
     
+    # Override TauREx default bounds with ADC competition priors
+    # This is CRITICAL - TauREx uses narrow bounds like [0.9, 1.1] for planet_radius
+    # but ADC competition allows [0.1, 3.0]. If ground truth is outside TauREx bounds,
+    # the transform will clamp values and produce zero gradients!
+    if verbose:
+        print(f"\nOverriding parameter bounds with ADC priors...")
+    
+    for param_name, bounds in adc_priors.items():
+        if param_name in param_info:
+            old_bounds = param_info[param_name]['range']
+            param_info[param_name]['range'] = bounds
+            if verbose:
+                print(f"  {param_name}: {old_bounds} -> {bounds}")
+    
+    # Randomize starting parameters if requested
+    if randomize_start:
+        if verbose:
+            print(f"\nRandomizing initial parameters (scale={randomize_scale}, seed={random_seed})...")
+        
+        rng = np.random.RandomState(random_seed)
+        
+        for param_name in fit_params:
+            if param_name in param_info and param_name in params:
+                bounds = param_info[param_name]['range']
+                scale = param_info[param_name]['scale']
+                
+                if scale == 'log':
+                    # For log-scale parameters (mixing ratios), randomize in log space
+                    log_min, log_max = np.log10(bounds[0]), np.log10(bounds[1])
+                    log_center = (log_min + log_max) / 2
+                    log_range = (log_max - log_min) * randomize_scale
+                    log_val = log_center + rng.uniform(-log_range/2, log_range/2)
+                    params[param_name] = jnp.array(10**log_val, dtype=dtype)
+                else:
+                    # For linear parameters (radius, temp), randomize in linear space
+                    center = (bounds[0] + bounds[1]) / 2
+                    param_range = (bounds[1] - bounds[0]) * randomize_scale
+                    val = center + rng.uniform(-param_range/2, param_range/2)
+                    params[param_name] = jnp.array(val, dtype=dtype)
+                
+                if verbose:
+                    print(f"  {param_name}: {float(params[param_name]):.6e}")
+    
     # Setup observation data with correct dtype
     obs_y = jnp.asarray(spectrum_dict['spectrum'], dtype=dtype)
     obs_err = jnp.asarray(spectrum_dict['noise'], dtype=dtype)
     
     if verbose:
         print(f"\nFitting parameters: {fit_params}")
-        print("Initial values:")
+        if not randomize_start:
+            print("Initial values (from posterior):")
+        else:
+            print("Initial values (randomized):")
         for k in fit_params:
             print(f"  {k}: {float(params[k]):.6e}")
         if has_gt and ground_truth is not None:
-            print("\nGround truth values:")
+            print("\nPosterior reference (for comparison):")
             for k in fit_params:
                 if k in ground_truth:
                     print(f"  {k}: {float(ground_truth[k]):.6e}")
-        print(f"\nStarting optimization ({steps} steps)...")
+        print(f"\nOptimizing to fit OBSERVED SPECTRUM...")
+        print(f"Optimizer: {optimizer.upper()}")
+        print(f"Loss function: {loss}")
+        if optimizer == 'adam':
+            print(f"Steps: {steps}, lr={lr}, clip_norm={clip_norm}, l2_reg={l2_reg}, log_prior={log_prior}")
+        else:
+            print(f"Max iterations: {steps}, multi_start={multi_start}")
     
-    # Run optimization with regularization
-    loss_kwargs = {}
-    if l2_reg > 0.0:
-        loss_kwargs['l2_reg'] = l2_reg
-    if log_prior is not None:
-        loss_kwargs['log_prior'] = log_prior
+    # Run optimization
+    from experiment import fit_with_value_and_grad_adam, fit_with_lbfgsb
     
-    final_params, losses = fit_with_value_and_grad_adam(
-        forward_binned=forward_model,
-        observed_y=obs_y,
-        observed_err=obs_err,
-        init_params=params,
-        param_info=param_info,
-        fit_params=fit_params,
-        steps=steps,
-        lr=lr,
-        clip_norm=1.0,
-        print_every=50 if verbose else None,
-        nan_guard=True,
-        loss="mse",
-        loss_kwargs=loss_kwargs
-    )
+    if optimizer == 'adam':
+        # Adam optimizer (first-order adaptive method)
+        loss_kwargs = {}
+        if l2_reg > 0.0:
+            loss_kwargs['l2_reg'] = l2_reg
+        if log_prior is not None:
+            loss_kwargs['log_prior'] = log_prior
+        
+        final_params, losses = fit_with_value_and_grad_adam(
+            forward_binned=forward_model,
+            observed_y=obs_y,
+            observed_err=obs_err,
+            init_params=params,
+            param_info=param_info,
+            fit_params=fit_params,
+            steps=steps,
+            lr=lr,
+            clip_norm=clip_norm,
+            print_every=50 if verbose else steps + 1,
+            nan_guard=True,
+            loss=loss,
+            loss_kwargs=loss_kwargs
+        )
+        all_results = None
+        
+    elif optimizer == 'lbfgs':
+        # L-BFGS-B optimizer (quasi-Newton with box constraints)
+        final_params, final_loss, all_results, losses = fit_with_lbfgsb(
+            forward_binned=forward_model,
+            observed_y=obs_y,
+            observed_err=obs_err,
+            init_params=params,
+            param_info=param_info,
+            fit_params=fit_params,
+            maxiter=steps,
+            print_every=100 if verbose else 0,
+            nan_guard=True,
+            loss=loss,
+            multi_start=multi_start,
+            random_seed=random_seed
+        )
+        
+    else:
+        raise ValueError(f"Unknown optimizer '{optimizer}'. Choose 'adam' or 'lbfgs'.")
     
     if verbose:
         print("\nFinal Results:")
@@ -630,7 +761,8 @@ def fit_adc_planet(
         'obs_spectrum': obs_spectrum,
         'spectrum_dict': spectrum_dict,
         'ground_truth': ground_truth if has_gt else None,
-        'aux_data': aux_data
+        'aux_data': aux_data,
+        'all_results': all_results  # L-BFGS multi-start results
     }
 
 

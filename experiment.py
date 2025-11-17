@@ -1352,6 +1352,15 @@ def fit_with_value_and_grad_adam(
         # Compute data likelihood
         if loss == "mse":
             data_loss = mse_loss(obs_y, pred, obs_err, reduction=reduction)
+        
+        elif loss == "chi_squared":
+            # Gaussian negative log-likelihood (as specified in ADC 2022 papers)
+            # -log P(D|model) = 0.5 * sum[log(2π*σ²) + (D-S)²/σ²]
+            # This is equation 5-6 from Changeat & Yip 2022 (arXiv:2206.14633)
+            log_term = jnp.log(2 * jnp.pi * obs_err**2)
+            residual_term = ((obs_y - pred) / obs_err)**2
+            nll = 0.5 * jnp.sum(log_term + residual_term)
+            data_loss = nll / len(obs_y)  # Average NLL per data point
 
         elif loss == "gaussian":
             data_loss = gaussian_nll(obs_y, pred, obs_err)
@@ -1376,7 +1385,7 @@ def fit_with_value_and_grad_adam(
 
         else:
             raise ValueError(f"Unknown loss '{loss}'. "
-                             "Choose from: 'mse', 'gaussian', 'lognormal', 'studentt', 'gp'.")
+                             "Choose from: 'mse', 'chi_squared', 'gaussian', 'lognormal', 'studentt', 'gp'.")
         
         # Add regularization terms
         reg_loss = 0.0
@@ -1416,9 +1425,11 @@ def fit_with_value_and_grad_adam(
         updates, opt_state = opt.update(g, opt_state, uvec)
         uvec = optax.apply_updates(uvec, updates)
 
+        # Always track loss
+        losses.append(float(val))
+        
         if (step % print_every) == 0 or step == steps - 1:
             grad_norm = float(jnp.linalg.norm(jnp.asarray(g)))
-            losses.append(float(val))
             print(f"step {step:4d} | loss={float(val):.6g} | ||grad||={grad_norm:.3e}")
 
         if not jnp.isfinite(val):
@@ -1428,6 +1439,212 @@ def fit_with_value_and_grad_adam(
     final_cfit = to_c(unpack(uvec))
     final_params = {**fixed, **final_cfit}
     return final_params, losses
+
+
+def fit_with_lbfgsb(
+    forward_binned,
+    observed_y,
+    observed_err,
+    init_params,
+    param_info,
+    fit_params,
+    maxiter=1000,
+    print_every=100,
+    nan_guard=True,
+    loss="chi_squared",
+    multi_start=1,
+    random_seed=None
+):
+    """
+    Fit using L-BFGS-B optimizer via scipy (more memory efficient).
+    
+    Uses scipy's L-BFGS-B implementation with JAX gradients. This is more
+    memory efficient than jaxopt's implementation for large problems.
+    
+    Args:
+        forward_binned: Forward model function
+        observed_y: Observed spectrum
+        observed_err: Measurement uncertainties
+        init_params: Initial parameters
+        param_info: Parameter metadata (bounds, scales)
+        fit_params: List of parameters to fit
+        maxiter: Maximum iterations per optimization run
+        print_every: Print frequency (<=0 to disable)
+        nan_guard: Replace NaN/Inf in predictions
+        loss: Loss function type ("chi_squared" or "mse")
+        multi_start: Number of random initializations (1 = single run from init_params)
+        random_seed: Random seed for multi-start
+    
+    Returns:
+        best_params: Best fit parameters
+        best_loss: Best loss value achieved
+        all_results: List of (params, loss) tuples from all runs
+        loss_history: Loss values during best run
+    """
+    from scipy.optimize import minimize
+    import numpy as np
+    
+    EPS = 1e-12
+    
+    # ---- transforms / packing ----
+    fixed = {k: v for k, v in init_params.items() if k not in fit_params}
+    train0 = {k: init_params[k] for k in fit_params}
+    to_c, to_u = make_transforms(param_info, fit_params)
+    u0 = to_u(train0)
+    pack, unpack, keys = make_packer(u0)
+    uvec0 = pack(u0)
+    
+    # ---- data tensors ----
+    obs_y = jnp.asarray(observed_y)
+    obs_err = jnp.maximum(jnp.asarray(observed_err), EPS)
+    
+    # ---- loss function ----
+    def loss_fn(uvec_):
+        udict = unpack(uvec_)
+        c_fit = to_c(udict)
+        params = {**fixed, **c_fit}
+        pred = jnp.asarray(forward_binned(params))
+        
+        if nan_guard:
+            pred = jnp.nan_to_num(pred, nan=0.0, posinf=1e300, neginf=-1e300)
+        
+        if loss == "chi_squared":
+            # Gaussian negative log-likelihood (as specified in ADC 2022 papers)
+            # -log P(D|model) = 0.5 * sum[log(2π*σ²) + (D-S)²/σ²]
+            log_term = jnp.log(2 * jnp.pi * obs_err**2)
+            residual_term = ((obs_y - pred) / obs_err)**2
+            nll = 0.5 * jnp.sum(log_term + residual_term)
+            return nll / len(obs_y)  # Average NLL per data point
+        elif loss == "mse":
+            # Mean squared error (unweighted)
+            return jnp.mean((obs_y - pred)**2)
+        else:
+            raise ValueError(f"Unknown loss '{loss}'. Choose 'chi_squared' or 'mse'.")
+    
+    # JIT compile loss and gradient
+    loss_and_grad_jit = jax.jit(jax.value_and_grad(loss_fn))
+    
+    # Wrapper for scipy (converts JAX arrays to numpy)
+    def scipy_loss_and_grad(uvec_np):
+        uvec_jax = jnp.array(uvec_np)
+        val, grad = loss_and_grad_jit(uvec_jax)
+        return float(val), np.array(grad, dtype=np.float64)
+    
+    # Track iterations
+    iteration_data = {'iter': 0, 'losses': [], 'last_print': -print_every}
+    
+    def callback(xk):
+        iteration_data['iter'] += 1
+        val, _ = scipy_loss_and_grad(xk)
+        iteration_data['losses'].append(val)
+        
+        if print_every > 0 and (iteration_data['iter'] - iteration_data['last_print']) >= print_every:
+            print(f"iter {iteration_data['iter']:4d} | loss={val:.6e}")
+            iteration_data['last_print'] = iteration_data['iter']
+    
+    # ---- Helper to run single optimization ----
+    def run_single_optimization(init_uvec, run_idx=0):
+        iteration_data['iter'] = 0
+        iteration_data['losses'] = []
+        iteration_data['last_print'] = -print_every
+        
+        if print_every > 0:
+            print(f"\n{'='*70}")
+            if multi_start > 1:
+                print(f"Run {run_idx+1}/{multi_start}")
+            print(f"{'='*70}")
+        
+        # Run scipy L-BFGS-B
+        result = minimize(
+            scipy_loss_and_grad,
+            np.array(init_uvec, dtype=np.float64),
+            method='L-BFGS-B',
+            jac=True,  # Gradient is returned by function
+            bounds=None,  # Use transforms for constraints
+            options={
+                'maxiter': maxiter,
+                'ftol': 1e-9,
+                'gtol': 1e-8,
+                'maxcor': 10,  # Number of corrections (memory usage)
+                'maxls': 20    # Max line search steps
+            },
+            callback=callback if print_every > 0 else None
+        )
+        
+        final_uvec = jnp.array(result.x)
+        final_loss = float(result.fun)
+        
+        # Reconstruct parameters
+        final_cfit = to_c(unpack(final_uvec))
+        final_params = {**fixed, **final_cfit}
+        
+        # Print results
+        if print_every > 0:
+            print(f"Converged: {result.success}")
+            print(f"Iterations: {result.nit}")
+            print(f"Function evals: {result.nfev}")
+            print(f"Final loss: {final_loss:.6e}")
+            print(f"Message: {result.message}")
+        
+        return final_params, final_loss, iteration_data['losses']
+    
+    # ---- Multi-start strategy ----
+    all_results = []
+    
+    if multi_start == 1:
+        # Single run from provided initial parameters
+        best_params, best_loss, loss_history = run_single_optimization(uvec0, 0)
+        all_results.append((best_params, best_loss))
+    else:
+        # Multiple runs from random initializations
+        rng = np.random.RandomState(random_seed)
+        
+        print(f"\n{'='*70}")
+        print(f"Multi-start optimization: {multi_start} runs")
+        print(f"{'='*70}")
+        
+        best_loss = float('inf')
+        best_params = None
+        loss_history = []
+        
+        for run_idx in range(multi_start):
+            # Generate random initialization
+            if run_idx == 0:
+                # First run uses provided initialization
+                init_uvec = uvec0
+            else:
+                # Random initialization: sample in constrained space, then transform
+                random_params = {}
+                for param_name in fit_params:
+                    bounds_c = param_info[param_name]['range']
+                    scale = param_info[param_name]['scale']
+                    
+                    if scale == 'log':
+                        # Sample in log space
+                        log_min, log_max = np.log10(bounds_c[0]), np.log10(bounds_c[1])
+                        log_val = rng.uniform(log_min, log_max)
+                        random_params[param_name] = jnp.array(10**log_val)
+                    else:
+                        # Sample in linear space
+                        random_params[param_name] = jnp.array(rng.uniform(bounds_c[0], bounds_c[1]))
+                
+                init_uvec = pack(to_u(random_params))
+            
+            # Run optimization
+            params, loss_val, history = run_single_optimization(np.array(init_uvec), run_idx)
+            all_results.append((params, loss_val))
+            
+            if loss_val < best_loss:
+                best_loss = loss_val
+                best_params = params
+                loss_history = history
+        
+        if print_every > 0:
+            print(f"\n{'='*70}")
+            print(f"Best result: loss = {best_loss:.6e}")
+            print(f"{'='*70}")
+    
+    return best_params, best_loss, all_results, loss_history
 
 # ========== PLOTTING ==========
 def plot_fit_comparison(obs, forward_binned, initial_params, final_params, fit_params, save_figure=True):

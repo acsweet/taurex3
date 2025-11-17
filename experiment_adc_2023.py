@@ -173,18 +173,29 @@ def plot_fit_with_ground_truth(result_dict, save_path=None):
     
     # Plot 3: Loss history
     ax = axes[2]
-    ax.plot(losses, linewidth=2)
+    steps = np.arange(len(losses))
+    ax.plot(steps, losses, linewidth=2, alpha=0.8)
     ax.set_xlabel('Optimization Step', fontsize=12)
     ax.set_ylabel('Loss (MSE)', fontsize=12)
     ax.set_title('Training Loss', fontsize=12)
     ax.set_yscale('log')
     ax.grid(True, alpha=0.3)
     
+    # Add text with convergence info
+    if len(losses) > 1:
+        improvement = losses[0] / losses[-1]
+        ax.text(0.98, 0.98, f'Steps: {len(losses)}\nImprovement: {improvement:.1f}x',
+                transform=ax.transAxes, verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5),
+                fontsize=10)
+    
     plt.tight_layout()
     
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"\nPlot saved to: {save_path}")
+    if save_path is None:
+        save_path = f"adc_planet_{result_dict['planet_id']}_fit.png"
+
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"\nPlot saved to: {save_path}")
     
     plt.show()
     
@@ -202,8 +213,8 @@ def main():
     parser = argparse.ArgumentParser(description='ADC 2023 Retrieval Experiment')
     parser.add_argument('--planet-id', type=int, default=1000,
                         help='Planet ID to fit (default: 1000)')
-    parser.add_argument('--steps', type=int, default=500,
-                        help='Number of optimization steps (default: 500)')
+    parser.add_argument('--steps', type=int, default=1000,
+                        help='Number of optimization steps (default: 1000)')
     parser.add_argument('--lr', type=float, default=1e-3,
                         help='Learning rate (default: 1e-3)')
     parser.add_argument('--nlayers', type=int, default=30,
@@ -214,11 +225,13 @@ def main():
                         default=['planet_radius', 'T', 'H2O', 'CO2', 'CO', 'CH4', 'NH3'],
                         help='Parameters to fit')
     parser.add_argument('--save-plot', type=str, default=None,
-                        help='Path to save plot (default: None)')
+                        help='Path to save plot (default: adc_planet_<id>_fit.png)')
     parser.add_argument('--l2-reg', type=float, default=0.0,
                         help='L2 regularization strength (default: 0.0)')
     parser.add_argument('--log-prior', type=float, default=None,
                         help='Log-space prior std for mixing ratios (default: None)')
+    parser.add_argument('--clip-norm', type=float, default=1.0,
+                        help='Gradient clipping norm (default: 1.0)')
     
     args = parser.parse_args()
     
@@ -242,6 +255,7 @@ def main():
         print(f"  L2 regularization: {args.l2_reg}")
     if args.log_prior is not None:
         print(f"  Log-space prior: {args.log_prior}")
+    print(f"  Gradient clipping: {args.clip_norm}")
     print("="*80)
     
     # Run fitting
@@ -257,7 +271,8 @@ def main():
         dtype=dtype,
         verbose=True,
         l2_reg=args.l2_reg,
-        log_prior=args.log_prior
+        log_prior=args.log_prior,
+        clip_norm=args.clip_norm
     )
     
     elapsed = time.time() - start_time
@@ -275,6 +290,11 @@ def main():
     
     # Generate plots
     print("\nGenerating plots...")
+    
+    # Auto-generate save path if not provided
+    if args.save_plot is None:
+        args.save_plot = f"adc_planet_{args.planet_id}_fit.png"
+    
     plot_fit_with_ground_truth(result, save_path=args.save_plot)
     
     # Save results summary
